@@ -6,10 +6,13 @@
 #include "esp_wifi.h"
 #include "esp_mac.h"
 #include <WiFi.h>
+#include <cmath>
 
 #define BUFFER_SIZE 256
+#define MAX_DEVICES 10  // Maximum number of unique MAC addresses you want to track
+#define TIMEOUT_PERIOD 10000  // Timeout period in milliseconds (10 seconds)
 
-int baudrate = 57600;
+int baudrate = 115200;
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 uint8_t system_id = 11; // Your system ID
@@ -28,26 +31,28 @@ uint8_t buffer[MAVLINK_MAX_PACKET_LEN]; // Buffer to hold GPS data
 
 static const char *TAG = "GPS_LOG";
 
-#define MAX_DEVICES 10  // Maximum number of unique MAC addresses you want to track
+constexpr double R = 6371000.0;  // Earth's radius in meters
+
 
 
 // GPS message structure
 typedef struct gps_message {
-    uint32_t time_boot_ms;
-    uint8_t sysid;
-    int32_t lat;
-    int32_t lon;
-    int32_t alt;
-    int32_t relative_alt;
-    int16_t vx;
-    int16_t vy;
-    int16_t vz;
+    uint32_t time_boot_ms;   /*< [ms] Timestamp (time since system boot).*/
+    uint8_t sysid; /*drone id*/
+    int32_t lat; /*< [degE7] Latitude, expressed*/
+    int32_t lon; /*< [degE7] Longitude, expressed*/
+    int32_t alt; /*< [mm] Altitude (MSL). Note that virtually all GPS modules provide both WGS84 and MSL.*/
+    int32_t relative_alt; /*< [mm] Altitude above home*/
+    int16_t vx;  /*< [cm/s] Ground X Speed (Latitude, positive north)*/
+    int16_t vy;  /*< [cm/s] Ground Y Speed (Longitude, positive east)*/
+    int16_t vz; /*< [cm/s] Ground Z Speed (Altitude, positive down)*/
 } gps_message;
 
 // Structure to hold MAC and associated GPS data
 typedef struct device_data {
     uint8_t mac[6];  // MAC address (6 bytes)
     gps_message gps_data;  // Associated GPS data
+    uint32_t last_update_time;  // Timestamp of the last received data
 } device_data;
 
 device_data devices[MAX_DEVICES];  // Array to hold MAC and associated data
@@ -56,6 +61,40 @@ int device_count = 0;  // Current count of devices in the table
 gps_message myData;
 gps_message receivedData;
 
+
+inline double toRadians(int32_t degE7) {
+    return (degE7 / 1e7) * (M_PI / 180.0);
+}
+
+// Function to calculate distance between two coordinates considering altitude
+double distanceBetweenCoordinates(int32_t lat1, int32_t lon1, uint32_t alt1,
+                                  int32_t lat2, int32_t lon2, uint32_t alt2) {
+    // Convert latitude and longitude from degrees * 10^7 to radians
+    double lat1Rad = toRadians(lat1);
+    double lon1Rad = toRadians(lon1);
+    double lat2Rad = toRadians(lat2);
+    double lon2Rad = toRadians(lon2);
+
+    // Haversine formula to calculate 2D distance (ignoring altitude)
+    double dLat = lat2Rad - lat1Rad;
+    double dLon = lon2Rad - lon1Rad;
+
+    double a = sin(dLat / 2) * sin(dLat / 2) +
+               cos(lat1Rad) * cos(lat2Rad) * 
+               sin(dLon / 2) * sin(dLon / 2);
+    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+
+    // 2D distance on Earth's surface in meters
+    double distance2D = R * c;
+
+    // Altitude difference in meters (convert mm to meters)
+    double altDiff = (alt2 - alt1) / 1000.0;
+
+    // 3D distance considering altitude difference
+    double distance3D = sqrt(distance2D * distance2D + altDiff * altDiff);
+
+    return distance3D;
+}
 
 int findDeviceIndex(const uint8_t *mac) {
     for (int i = 0; i < device_count; i++) {
@@ -66,17 +105,20 @@ int findDeviceIndex(const uint8_t *mac) {
     return -1;  // MAC not found
 }
 
-void addOrUpdateDevice(const uint8_t *mac, const gps_message *data) {
+
+void addOrUpdateDevice(const uint8_t *mac, const gps_message *data, uint32_t current_time) {
     int index = findDeviceIndex(mac);
 
     if (index != -1) {
         // MAC address found, update existing data
         devices[index].gps_data = *data;
+        devices[index].last_update_time = current_time;  // Update last update time
     } else {
         // MAC address not found, add new entry if space is available
         if (device_count < MAX_DEVICES) {
             memcpy(devices[device_count].mac, mac, 6);  // Copy MAC address
             devices[device_count].gps_data = *data;  // Copy GPS data
+            devices[device_count].last_update_time = current_time;  // Set last update time
             device_count++;
         } else {
             ESP_LOGE(TAG, "Device table is full. Can't add new device.");
@@ -84,18 +126,36 @@ void addOrUpdateDevice(const uint8_t *mac, const gps_message *data) {
     }
 }
 
+// Function to remove stale entries from the device table
+void removeStaleDevices(uint32_t current_time) {
+    for (int i = 0; i < device_count; i++) {
+        // Check if the last update time exceeds the timeout period
+        if (current_time - devices[i].last_update_time > TIMEOUT_PERIOD) {
+            ESP_LOGE(TAG, "Removing stale device: %02X:%02X:%02X:%02X:%02X:%02X",
+                     devices[i].mac[0], devices[i].mac[1], devices[i].mac[2],
+                     devices[i].mac[3], devices[i].mac[4], devices[i].mac[5]);
+            // Shift the remaining devices up
+            for (int j = i; j < device_count - 1; j++) {
+                devices[j] = devices[j + 1];
+            }
+            device_count--;
+            i--;  // Recheck the current index after removal
+        }
+    }
+}
+
+
 void printDeviceTable() {
     ESP_LOGI(TAG, "Device Table:");
     for (int i = 0; i < device_count; i++) {
-        ESP_LOGE(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X | Lat: %ld, Lon: %ld, Alt: %ld, VelX: %d, VelY: %d, VelZ: %d, Time Boot: %ld",
+        ESP_LOGE(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X | Lat: %ld, Lon: %ld, Alt: %ld, VelX: %d, VelY: %d, VelZ: %d, Time Boot: %ld, Last Update: %ld",
                  devices[i].mac[0], devices[i].mac[1], devices[i].mac[2],
                  devices[i].mac[3], devices[i].mac[4], devices[i].mac[5],
                  devices[i].gps_data.lat, devices[i].gps_data.lon, devices[i].gps_data.alt,
                  devices[i].gps_data.vx, devices[i].gps_data.vy, devices[i].gps_data.vz,
-                 devices[i].gps_data.time_boot_ms);
+                 devices[i].gps_data.time_boot_ms, devices[i].last_update_time);
     }
 }
-
 
 void Stream() {
     delay(2000);
@@ -199,8 +259,9 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
         gps_message receivedData;
         memcpy(&receivedData, incomingData, sizeof(receivedData));
 
-        // Add or update the device data in the table
-        addOrUpdateDevice(mac, &receivedData);
+        // Add or update the device data in the table with the current time
+        uint32_t current_time = millis();
+        addOrUpdateDevice(mac, &receivedData, current_time);
 
         // Print the updated device table
         printDeviceTable();
@@ -259,7 +320,6 @@ void setup() {
 void loop() {
     // Read GPS data
     ReadGPS(&latitude, &longitude, &altitude, &vel_x, &vel_y, &vel_z, &time_boot_ms);
-
     
     // Check if GPS data is valid
     if (latitude != 0 && longitude != 0 && time_boot_ms != 0) {
@@ -282,6 +342,10 @@ void loop() {
     } else {
         ESP_LOGI(TAG, "Waiting for valid GPS data...");
     }
+
+    // Periodically check and remove stale devices
+    uint32_t current_time = millis();
+    removeStaleDevices(current_time);
 
     delay(100);  // Control sending rate (10 Hz)
 }

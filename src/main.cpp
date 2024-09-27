@@ -12,7 +12,7 @@
 #define MAX_DEVICES 10  // Maximum number of unique MAC addresses you want to track
 #define TIMEOUT_PERIOD 10000  // Timeout period in milliseconds (10 seconds)
 
-int baudrate = 115200;
+int baudrate = 57600;
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 uint8_t system_id = 11; // Your system ID
@@ -30,9 +30,6 @@ uint32_t time_boot_ms, latitude, longitude, altitude;
 uint8_t buffer[MAVLINK_MAX_PACKET_LEN]; // Buffer to hold GPS data
 
 static const char *TAG = "GPS_LOG";
-
-constexpr double R = 6371000.0;  // Earth's radius in meters
-
 
 
 // GPS message structure
@@ -60,41 +57,6 @@ int device_count = 0;  // Current count of devices in the table
 
 gps_message myData;
 gps_message receivedData;
-
-
-inline double toRadians(int32_t degE7) {
-    return (degE7 / 1e7) * (M_PI / 180.0);
-}
-
-// Function to calculate distance between two coordinates considering altitude
-double distanceBetweenCoordinates(int32_t lat1, int32_t lon1, uint32_t alt1,
-                                  int32_t lat2, int32_t lon2, uint32_t alt2) {
-    // Convert latitude and longitude from degrees * 10^7 to radians
-    double lat1Rad = toRadians(lat1);
-    double lon1Rad = toRadians(lon1);
-    double lat2Rad = toRadians(lat2);
-    double lon2Rad = toRadians(lon2);
-
-    // Haversine formula to calculate 2D distance (ignoring altitude)
-    double dLat = lat2Rad - lat1Rad;
-    double dLon = lon2Rad - lon1Rad;
-
-    double a = sin(dLat / 2) * sin(dLat / 2) +
-               cos(lat1Rad) * cos(lat2Rad) * 
-               sin(dLon / 2) * sin(dLon / 2);
-    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
-
-    // 2D distance on Earth's surface in meters
-    double distance2D = R * c;
-
-    // Altitude difference in meters (convert mm to meters)
-    double altDiff = (alt2 - alt1) / 1000.0;
-
-    // 3D distance considering altitude difference
-    double distance3D = sqrt(distance2D * distance2D + altDiff * altDiff);
-
-    return distance3D;
-}
 
 int findDeviceIndex(const uint8_t *mac) {
     for (int i = 0; i < device_count; i++) {

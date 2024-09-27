@@ -15,22 +15,21 @@
 int baudrate = 57600;
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-uint8_t system_id = 11; // Your system ID
-uint8_t component_id = 162; // Your component ID
+uint8_t system_id = 11;  // Your system ID
+uint8_t component_id = 162;  // Your component ID
 uint8_t type = MAV_TYPE_FLARM;
 uint8_t autopilot = MAV_AUTOPILOT_ARDUPILOTMEGA;
-uint8_t received_sysid = 0; // Pixhawk sysid
-uint8_t received_id = 0; // Pixhawk sysid
-static uint8_t received_compid = 0; // Pixhawk compid
-static uint8_t tx_buf[BUFFER_SIZE] = { 0 };
+uint8_t received_sysid = 0;  // Pixhawk sysid
+uint8_t received_id = 0;  // Pixhawk sysid
+static uint8_t received_compid = 0;  // Pixhawk compid
+static uint8_t tx_buf[BUFFER_SIZE] = {0};
 const uart_port_t CONFIG_UART_PORT_NUM = UART_NUM_2;
 
 uint16_t vel_x, vel_y, vel_z, len;
 uint32_t time_boot_ms, latitude, longitude, altitude;
-uint8_t buffer[MAVLINK_MAX_PACKET_LEN]; // Buffer to hold GPS data
+uint8_t buffer[MAVLINK_MAX_PACKET_LEN];  // Buffer to hold GPS data
 
 static const char *TAG = "GPS_LOG";
-
 
 // GPS message structure
 typedef struct gps_message {
@@ -45,10 +44,19 @@ typedef struct gps_message {
     int16_t vz; /*< [cm/s] Ground Z Speed (Altitude, positive down)*/
 } gps_message;
 
+typedef struct distance_message { 
+    uint32_t time_boot_ms;   /*< [ms] Timestamp (time since system boot).*/
+    uint8_t sysid; /* drone id */ 
+    int32_t distance; /* [m] Distance between this drone and another */
+    int16_t vx;  /*< [cm/s] Ground X Speed (Latitude, positive north) */
+    int16_t vy;  /*< [cm/s] Ground Y Speed (Longitude, positive east) */
+    int16_t vz;  /*< [cm/s] Ground Z Speed (Altitude, positive down) */
+} distance_message;
+
 // Structure to hold MAC and associated GPS data
 typedef struct device_data {
     uint8_t mac[6];  // MAC address (6 bytes)
-    gps_message gps_data;  // Associated GPS data
+    distance_message distance_data;  // Associated distance data
     uint32_t last_update_time;  // Timestamp of the last received data
 } device_data;
 
@@ -57,6 +65,13 @@ int device_count = 0;  // Current count of devices in the table
 
 gps_message myData;
 gps_message receivedData;
+
+constexpr double R = 6371000.0;  // Earth's radius in meters
+
+// Convert degrees * 10^7 to radians
+inline double toRadians(int32_t degE7) {
+    return (degE7 / 1e7) * (M_PI / 180.0);
+}
 
 int findDeviceIndex(const uint8_t *mac) {
     for (int i = 0; i < device_count; i++) {
@@ -67,19 +82,18 @@ int findDeviceIndex(const uint8_t *mac) {
     return -1;  // MAC not found
 }
 
-
-void addOrUpdateDevice(const uint8_t *mac, const gps_message *data, uint32_t current_time) {
+void addOrUpdateDevice(const uint8_t *mac, const distance_message *data, uint32_t current_time) {
     int index = findDeviceIndex(mac);
 
     if (index != -1) {
-        // MAC address found, update existing data
-        devices[index].gps_data = *data;
+        // MAC address found, update existing distance data
+        devices[index].distance_data = *data;
         devices[index].last_update_time = current_time;  // Update last update time
     } else {
         // MAC address not found, add new entry if space is available
         if (device_count < MAX_DEVICES) {
             memcpy(devices[device_count].mac, mac, 6);  // Copy MAC address
-            devices[device_count].gps_data = *data;  // Copy GPS data
+            devices[device_count].distance_data = *data;  // Copy distance data
             devices[device_count].last_update_time = current_time;  // Set last update time
             device_count++;
         } else {
@@ -106,48 +120,103 @@ void removeStaleDevices(uint32_t current_time) {
     }
 }
 
-
 void printDeviceTable() {
     ESP_LOGI(TAG, "Device Table:");
     for (int i = 0; i < device_count; i++) {
-        ESP_LOGE(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X | Lat: %ld, Lon: %ld, Alt: %ld, VelX: %d, VelY: %d, VelZ: %d, Time Boot: %ld, Last Update: %ld",
+        ESP_LOGE(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X | Distance: %d m, VelX: %d, VelY: %d, VelZ: %d, Time Boot: %ld, Last Update: %ld",
                  devices[i].mac[0], devices[i].mac[1], devices[i].mac[2],
                  devices[i].mac[3], devices[i].mac[4], devices[i].mac[5],
-                 devices[i].gps_data.lat, devices[i].gps_data.lon, devices[i].gps_data.alt,
-                 devices[i].gps_data.vx, devices[i].gps_data.vy, devices[i].gps_data.vz,
-                 devices[i].gps_data.time_boot_ms, devices[i].last_update_time);
+                 devices[i].distance_data.distance,  // Distance between this drone and the other
+                 devices[i].distance_data.vx,  // Velocity in X direction
+                 devices[i].distance_data.vy,  // Velocity in Y direction
+                 devices[i].distance_data.vz,  // Velocity in Z direction
+                 devices[i].distance_data.time_boot_ms,  // Timestamp of when the data was recorded
+                 devices[i].last_update_time);  // Last time the device data was updated
     }
+}
+
+// Function to calculate the distance between two coordinates considering altitude
+double distanceBetweenCoordinates(int32_t lat1, int32_t lon1, uint32_t alt1,
+                                  int32_t lat2, int32_t lon2, uint32_t alt2) {
+    double lat1Rad = toRadians(lat1);
+    double lon1Rad = toRadians(lon1);
+    double lat2Rad = toRadians(lat2);
+    double lon2Rad = toRadians(lon2);
+
+    double dLat = lat2Rad - lat1Rad;
+    double dLon = lon2Rad - lon1Rad;
+
+    double a = sin(dLat / 2) * sin(dLat / 2) +
+               cos(lat1Rad) * cos(lat2Rad) *
+               sin(dLon / 2) * sin(dLon / 2);
+    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+
+    double distance2D = R * c;
+
+    double altDiff = (alt2 - alt1) / 1000.0;
+
+    double distance3D = sqrt(distance2D * distance2D + altDiff * altDiff);
+
+    return distance3D;
+}
+
+// Callback when data is received via ESP-NOW
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+    if (len == sizeof(gps_message)) {
+        gps_message receivedData;
+        memcpy(&receivedData, incomingData, sizeof(receivedData));
+
+        double distance = distanceBetweenCoordinates(myData.lat, myData.lon, myData.alt,
+                                                     receivedData.lat, receivedData.lon, receivedData.alt);
+        
+        distance_message dist_msg;
+        dist_msg.time_boot_ms = myData.time_boot_ms;
+        dist_msg.sysid = receivedData.sysid;
+        dist_msg.distance = static_cast<int32_t>(distance);  // Cast distance to int32_t (in meters)
+        dist_msg.vx = receivedData.vx;  // Copy velocities
+        dist_msg.vy = receivedData.vy;
+        dist_msg.vz = receivedData.vz;
+
+        uint32_t current_time = millis();
+        addOrUpdateDevice(mac, &dist_msg, current_time);
+
+        printDeviceTable();
+    } else {
+        ESP_LOGE(TAG, "Invalid data length received");
+    }
+}
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    ESP_LOGI(TAG, "Message Send Status: %s", status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
 }
 
 void Stream() {
     delay(2000);
     int flag = 1;
     ESP_LOGE("AutoPilot", "Sending Heartbeats...");
-    
+
     mavlink_message_t msghb;
     mavlink_heartbeat_t heartbeat;
     uint8_t bufhb[MAVLINK_MAX_PACKET_LEN];
-    
-    // Pack and send a heartbeat message
+
     mavlink_msg_heartbeat_pack(system_id, component_id, &msghb, type, autopilot, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0, MAV_STATE_STANDBY);
     uint16_t lenhb = mavlink_msg_to_send_buffer(bufhb, &msghb);
-    
+
     delay(1000);
-    
-    // Send the heartbeat using UART
+
     uart_write_bytes(CONFIG_UART_PORT_NUM, (const char *)bufhb, lenhb);
-    ESP_LOGE("AutoPilot", "Heartbeats sent! Now will check for received heartbeats to record sysid and compid...");
+    ESP_LOGE("AutoPilot", "Heartbeats sent!");
 
     while (flag == 1) {
         delay(1);
         size_t available_bytes = 0;
         uart_get_buffered_data_len(CONFIG_UART_PORT_NUM, &available_bytes);
-        
+
         while (available_bytes > 0) {
             mavlink_message_t msgpx;
             mavlink_status_t statuspx;
             uint8_t ch;
-            
+
             int len = uart_read_bytes(CONFIG_UART_PORT_NUM, &ch, 1, 20 / portTICK_RATE_MS);
             if (len > 0) {
                 if (mavlink_parse_char(MAVLINK_COMM_0, ch, &msgpx, &statuspx)) {
@@ -170,13 +239,11 @@ void Stream() {
     mavlink_message_t msgds;
     uint8_t bufds[MAVLINK_MAX_PACKET_LEN];
     mavlink_msg_request_data_stream_pack(system_id, component_id, &msgds, received_sysid, received_compid, MAV_DATA_STREAM_ALL , 0x05, 1);
-    
+
     uint16_t lends = mavlink_msg_to_send_buffer(bufds, &msgds);
     delay(1000);
     uart_write_bytes(CONFIG_UART_PORT_NUM, (const char *)bufds, lends);
     ESP_LOGE("AutoPilot", "Request sent!");
-    
- 
 }
 
 void ReadGPS(uint32_t *lat, uint32_t *lon, uint32_t *alt, uint16_t *velx, uint16_t *vely, uint16_t *velz, uint32_t *time) {
@@ -213,28 +280,6 @@ void ReadGPS(uint32_t *lat, uint32_t *lon, uint32_t *alt, uint16_t *velx, uint16
     *vely = y;
     *velz = z;
     *time = t;
-}
-
-// Callback when data is received via ESP-NOW
-void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-    if (len == sizeof(gps_message)) {
-        gps_message receivedData;
-        memcpy(&receivedData, incomingData, sizeof(receivedData));
-
-        // Add or update the device data in the table with the current time
-        uint32_t current_time = millis();
-        addOrUpdateDevice(mac, &receivedData, current_time);
-
-        // Print the updated device table
-        printDeviceTable();
-    } else {
-        ESP_LOGE(TAG, "Invalid data length received");
-    }
-}
-
-
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    ESP_LOGI(TAG, "Message Send Status: %s", status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
 }
 
 void setup() {

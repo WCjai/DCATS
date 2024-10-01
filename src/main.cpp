@@ -25,8 +25,13 @@ static uint8_t received_compid = 0; // Pixhawk compid
 static uint8_t tx_buf[BUFFER_SIZE] = { 0 };
 const uart_port_t CONFIG_UART_PORT_NUM = UART_NUM_2;
 
-uint16_t vel_x, vel_y, vel_z, len, hdg;
-uint32_t latitude, longitude, altitude, target_lat, target_lon, target_alt;
+uint16_t hdg;
+int16_t vel_x, vel_y, vel_z;
+uint16_t len;
+int32_t latitude, longitude, altitude, target_lat, target_lon, target_alt;
+
+
+
 uint8_t buffer[MAVLINK_MAX_PACKET_LEN]; // Buffer to hold GPS data
 
 const double EARTH_RADIUS = 6371000.0; // Earth's radius in meters
@@ -311,10 +316,10 @@ void computeTotalVelocity(const Agent& currentAgent, const std::vector<Agent>& n
     total_vx = rep_vx + self_drive_vx - friction_vx; // North (X)
     total_vy = rep_vy + self_drive_vy - friction_vy; // East (Y)
     total_vz = rep_vz + self_drive_vz - friction_vz; // Down (Z)
-    ESP_LOGE("DCATS", "repulsive Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", rep_vx, rep_vy, rep_vz);
-    ESP_LOGE("DCATS", "friction Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", friction_vx, friction_vy, friction_vz);
-    ESP_LOGE("DCATS", "Self-drive Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", self_drive_vx, self_drive_vy, self_drive_vz);
-    ESP_LOGE("DCATS", "Total Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", total_vx, total_vy, total_vz);
+    //ESP_LOGE("DCATS", "repulsive Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", rep_vx, rep_vy, rep_vz);
+    //ESP_LOGE("DCATS", "friction Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", friction_vx, friction_vy, friction_vz);
+    //ESP_LOGE("DCATS", "Self-drive Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", self_drive_vx, self_drive_vy, self_drive_vz);
+    //ESP_LOGE("DCATS", "Total Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", total_vx, total_vy, total_vz);
 }
 
 
@@ -439,10 +444,11 @@ void Stream() {
  
 }
 
-void ReadGPS(uint32_t *lat, uint32_t *lon, uint32_t *alt, uint16_t *velx, uint16_t *vely, uint16_t *velz, uint16_t *hdg) {
+void ReadGPS(int32_t *lat, int32_t *lon, int32_t *alt, int16_t *velx, int16_t *vely, int16_t *velz, uint16_t *hdg) {
     size_t available_bytes = 0;
     uart_get_buffered_data_len(CONFIG_UART_PORT_NUM, &available_bytes);
-    uint16_t x = 0, y = 0, z = 0, h = 0;
+    uint16_t h = 0;
+    int16_t x = 0, y = 0, z = 0;
     uint32_t  la = 0, lo = 0, al = 0;
     if (available_bytes > 0) {
         int len = uart_read_bytes(CONFIG_UART_PORT_NUM, tx_buf, available_bytes, 20 / portTICK_RATE_MS);
@@ -474,6 +480,66 @@ void ReadGPS(uint32_t *lat, uint32_t *lon, uint32_t *alt, uint16_t *velx, uint16
     *velz = z;
     *hdg = h;
 }
+
+void ReadGPSandTarget(int32_t *lat, int32_t *lon, int32_t *alt, int16_t *velx, int16_t *vely, int16_t *velz, uint16_t *hdg, 
+             int32_t *target_lat, int32_t *target_lon, int32_t *target_alt) {
+    size_t available_bytes = 0;
+    uart_get_buffered_data_len(CONFIG_UART_PORT_NUM, &available_bytes);
+    uint16_t h = 0;
+    int16_t x = 0, y = 0, z = 0;
+    int32_t la = 0, lo = 0, al = 0;
+    int32_t t_lat = 0, t_lon = 0, t_alt = 0;
+    float _alt = 0;
+    
+    if (available_bytes > 0) {
+        int len = uart_read_bytes(CONFIG_UART_PORT_NUM, tx_buf, available_bytes, 20 / portTICK_RATE_MS);
+        delay(100);  // Control sending rate (10 Hz)
+        if (len > 0) {
+            mavlink_message_t msg;
+            mavlink_status_t status1;
+            for (int i = 0; i < len; ++i) {
+                if (mavlink_parse_char(MAVLINK_COMM_1, tx_buf[i], &msg, &status1)) {
+                    // Handle GLOBAL_POSITION_INT message
+                    if (msg.msgid == MAVLINK_MSG_ID_GLOBAL_POSITION_INT) {
+                        mavlink_global_position_int_t data;
+                        mavlink_msg_global_position_int_decode(&msg, &data);
+                        la = data.lat;
+                        lo = data.lon;
+                        al = data.alt;
+                        x = data.vx;
+                        y = data.vy;
+                        z = data.vz;
+                        h = data.hdg;
+                    }
+                    // Handle POSITION_TARGET_GLOBAL_INT message
+                    else if (msg.msgid == MAVLINK_MSG_ID_POSITION_TARGET_GLOBAL_INT) {
+                        mavlink_position_target_global_int_t target_data;
+                        mavlink_msg_position_target_global_int_decode(&msg, &target_data);
+                        t_lat = target_data.lat_int;
+                        t_lon = target_data.lon_int;
+                        t_alt = (int32_t)(target_data.alt * 1000);
+                        ESP_LOGE(TAG, "Target Latitude: %d, Longitude: %d", t_lat, t_lon);
+                    }
+                }
+            }
+        }
+    }
+    // Assigning the global position values to output variables
+    *lat = la;
+    *lon = lo;
+    *alt = al;
+    *velx = x;
+    *vely = y;
+    *velz = z;
+    *hdg = h;
+
+    // Assigning the target position values to output variables
+    *target_lat = t_lat;
+    *target_lon = t_lon;
+    *target_alt = t_alt;
+}
+
+
 
 // Callback when data is received via ESP-NOW
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
@@ -555,10 +621,12 @@ Agent convertToAgent(const device_data& device) {
 
 void loop() {
     // Read GPS data
-    ReadGPS(&latitude, &longitude, &altitude, &vel_x, &vel_y, &vel_z, &hdg);
-    
+    //ReadGPS(&latitude, &longitude, &altitude, &vel_x, &vel_y, &vel_z, &hdg);
+    ReadGPSandTarget(&latitude, &longitude, &altitude, &vel_x, &vel_y, &vel_z, &hdg, &target_lat, &target_lon, &target_alt);
+
     // Check if GPS data is valid
-    if (latitude != 0 && longitude != 0) {
+    double total_vx, total_vy, total_vz;
+    if (latitude != 0 && longitude != 0 && target_lat != 0 && target_lon != 0  && target_alt != 0) {
         myData.lat = latitude;
         myData.lon = longitude;
         myData.alt = altitude;
@@ -569,7 +637,8 @@ void loop() {
         myData.target_lat = target_lat;
         myData.target_lon = target_lon;
         myData.target_alt = target_alt;
-        ESP_LOGE(TAG, "Target Latitude: %d, Longitude: %d, Altitude: %d", target_lat, target_lon, target_alt);
+
+        //ESP_LOGE(TAG, "Target Latitude: %d, Longitude: %d, Altitude: %d", target_lat, target_lon, target_alt);
     
 
         // Send the data over ESP-NOW
@@ -579,22 +648,27 @@ void loop() {
         } else {
             ESP_LOGE(TAG, "Error sending GPS message");
         }
-    } else {
-        ESP_LOGI(TAG, "Waiting for valid GPS data...");
-    }
+
+        std::vector<Agent> neighbors;
+
+        for (int i = 0; i < device_count; ++i) {  // Add 2 devices for example, extend as needed
+            neighbors.push_back(convertToAgent(devices[i]));
+        }
+
+        
+        computeTotalVelocity(myData, neighbors, total_vx, total_vy, total_vz);
+        } else {
+            total_vx, total_vy, total_vz = 0;
+            ESP_LOGI(TAG, "Waiting for valid GPS data...");
+
+        }
+    ESP_LOGE("DCATS", "Total Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", total_vx, total_vy, total_vz);
 
     // Periodically check and remove stale devices
     uint32_t current_time = millis();
     removeStaleDevices(current_time);
-    std::vector<Agent> neighbors;
-
-    for (int i = 0; i < device_count; ++i) {  // Add 2 devices for example, extend as needed
-        neighbors.push_back(convertToAgent(devices[i]));
-    }
-
-    double total_vx, total_vy, total_vz;
-    computeTotalVelocity(myData, neighbors, total_vx, total_vy, total_vz);
 
 
-    delay(100);  // Control sending rate (10 Hz)
+
+
 }

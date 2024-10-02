@@ -30,6 +30,8 @@ int16_t vel_x, vel_y, vel_z;
 uint16_t len;
 int32_t latitude, longitude, altitude, target_lat, target_lon, target_alt;
 
+bool enable_selfdrive = false;
+
 
 
 uint8_t buffer[MAVLINK_MAX_PACKET_LEN]; // Buffer to hold GPS data
@@ -37,12 +39,12 @@ uint8_t buffer[MAVLINK_MAX_PACKET_LEN]; // Buffer to hold GPS data
 const double EARTH_RADIUS = 6371000.0; // Earth's radius in meters
 //const double DEG_TO_RAD = M_PI / 180.0; // Conversion factor from degrees to radians
 
-const double REPULSION_ZONE_RADIUS = 20.0; // Repulsion zone radius in meters
+const double REPULSION_ZONE_RADIUS = 100.0; // Repulsion zone radius in meters
 const double REPULSION_GAIN = 0.1; // Repulsion gain factor
 
 const double FRICTION_THRESHOLD_VELOCITY = 2.0; // Minimum friction velocity in m/s
 const double FRICTION_GAIN = 0.1; // Friction gain factor
-const double R = 10; // Offset value
+const double R = 50; // Offset value
 const double a = 0.3; // Acceleration limit
 
 const double MAX_SPEED = 5.0; // Max speed in m/s for self-drive velocity
@@ -102,10 +104,15 @@ double computeDistance(double x1, double y1, double z1, double x2, double y2, do
 }
 
 // Compute relative velocity between two agents in NED frame
-double computeRelativeVelocity(const Agent& agent_i, const Agent& agent_j) {
-    double vx_diff = (agent_i.vx - agent_j.vx) / 100.0; // Convert cm/s to m/s
-    double vy_diff = (agent_i.vy - agent_j.vy) / 100.0; // Convert cm/s to m/s
-    double vz_diff = (agent_i.vz - agent_j.vz) / 100.0; // Convert cm/s to m/s
+double computeRelativeVelocity(const Agent& agent1, const Agent& agent2) {
+    // Calculate the relative velocity (in m/s)
+    double vx_diff = (agent1.vx - agent2.vx) / 100.0; // Convert cm/s to m/s
+    double vy_diff = (agent1.vy - agent2.vy) / 100.0;
+    double vz_diff = (agent1.vz - agent2.vz) / 100.0;
+    
+    //ESP_LOGE(TAG, "Agent 1 Velocity (vx, vy, vz): %.2f, %.2f, %.2f", agent1.vx / 100.0, agent1.vy / 100.0, agent1.vz / 100.0);
+    //ESP_LOGE(TAG, "Agent 2 Velocity (vx, vy, vz): %.2f, %.2f, %.2f", agent2.vx / 100.0, agent2.vy / 100.0, agent2.vz / 100.0);
+
     return sqrt(vx_diff * vx_diff + vy_diff * vy_diff + vz_diff * vz_diff);
 }
 
@@ -147,7 +154,7 @@ double computeBrakingFunction(double distance, double rho, double R, double a) {
 }
 
 // Compute frictional velocity for an agent based on its neighbors
-void computeFrictionVelocity(const Agent& currentAgent, const std::vector<Agent>& neighbors, double rho, double& friction_vx, double& friction_vy, double& friction_vz) {
+void computeFrictionVelocity(const Agent& currentAgent, const std::vector<Agent>& neighbors, double rho, double& friction_vx, double& friction_vy, double& friction_vz) { 
     friction_vx = 0.0;
     friction_vy = 0.0;
     friction_vz = 0.0;
@@ -159,8 +166,7 @@ void computeFrictionVelocity(const Agent& currentAgent, const std::vector<Agent>
 
         // Compute distance between current agent and neighbor
         double distance = computeDistance(0, 0, 0, x_j, y_j, z_j); // Current agent's NED position is always (0, 0, 0)
-        //std::cout << "Distance between agents: " << distance << " meters." << std::endl;
-          ESP_LOGE(TAG, "Distance between agents: %.2f m", distance);
+        //ESP_LOGE(TAG, "Distance between agents: %.2f m", distance);
 
         // Only apply friction if the distance is less than R
         if (distance < R) {
@@ -169,10 +175,10 @@ void computeFrictionVelocity(const Agent& currentAgent, const std::vector<Agent>
 
             // Compute friction threshold velocity
             double v_friction_threshold = std::max(FRICTION_THRESHOLD_VELOCITY, computeBrakingFunction(distance, rho, R, a));
+            ESP_LOGE(TAG, "Relative Velocity: %.2f m/s, Friction Threshold: %.2f m/s", v_ij, v_friction_threshold);
 
             // If relative velocity exceeds the threshold, apply friction
             if (v_ij > v_friction_threshold) {
-                //std::cout << "Applying friction force between Agent 1 and Neighbor. Relative Velocity: " << v_ij << std::endl;
                 ESP_LOGE(TAG, "Applying friction force between Agent 1 and Neighbor: %.2f m/s^2", v_ij);
 
                 double friction_force = FRICTION_GAIN * (v_ij - v_friction_threshold);
@@ -183,6 +189,9 @@ void computeFrictionVelocity(const Agent& currentAgent, const std::vector<Agent>
                 double vz_diff = (currentAgent.vz - neighbor.vz) / 100.0;
                 double velocity_magnitude = sqrt(vx_diff * vx_diff + vy_diff * vy_diff + vz_diff * vz_diff);
 
+                ESP_LOGE(TAG, "Velocity Differences - X: %.2f, Y: %.2f, Z: %.2f", vx_diff, vy_diff, vz_diff);
+                ESP_LOGE(TAG, "Velocity Magnitude: %.2f m/s", velocity_magnitude);
+
                 if (velocity_magnitude > 0) {
                     friction_vx += friction_force * (vx_diff / velocity_magnitude);
                     friction_vy += friction_force * (vy_diff / velocity_magnitude);
@@ -192,6 +201,8 @@ void computeFrictionVelocity(const Agent& currentAgent, const std::vector<Agent>
         }
     }
 }
+
+
 
 // Convert heading (in centidegrees) to a unit vector (dx, dy)
 void headingToUnitVector(uint16_t hdg, double& dx, double& dy) {
@@ -301,25 +312,27 @@ void computeSelfDriveVelocity(const Agent& currentAgent, const std::vector<Agent
 void computeTotalVelocity(const Agent& currentAgent, const std::vector<Agent>& neighbors, double& total_vx, double& total_vy, double& total_vz) {
     double rep_vx, rep_vy, rep_vz;
     double friction_vx, friction_vy, friction_vz;
-    double self_drive_vx, self_drive_vy, self_drive_vz;
+    double self_drive_vx, self_drive_vy, self_drive_vz =0;
 
     // Compute repulsive velocity with heading adjustment
     computeRepulsiveVelocityWithHeading(currentAgent, neighbors, rep_vx, rep_vy, rep_vz);
 
     // Compute friction velocity
     computeFrictionVelocity(currentAgent, neighbors, 0.5, friction_vx, friction_vy, friction_vz);
-
-    // Compute self-drive velocity toward the target
+    
+    
     computeSelfDriveVelocity(currentAgent, neighbors, self_drive_vx, self_drive_vy, self_drive_vz);
+    // Compute self-drive velocity toward the target
+    
 
     // Combine the velocities (Repulsive + Friction + Self-Drive) in NED
-    total_vx = rep_vx + self_drive_vx - friction_vx; // North (X)
-    total_vy = rep_vy + self_drive_vy - friction_vy; // East (Y)
-    total_vz = rep_vz + self_drive_vz - friction_vz; // Down (Z)
+    total_vx = rep_vx + self_drive_vx + friction_vx; // North (X)
+    total_vy = rep_vy + self_drive_vy + friction_vy; // East (Y)
+    total_vz = rep_vz + self_drive_vz + friction_vz; // Down (Z)
     //ESP_LOGE("DCATS", "repulsive Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", rep_vx, rep_vy, rep_vz);
     //ESP_LOGE("DCATS", "friction Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", friction_vx, friction_vy, friction_vz);
     //ESP_LOGE("DCATS", "Self-drive Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", self_drive_vx, self_drive_vy, self_drive_vz);
-    //ESP_LOGE("DCATS", "Total Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", total_vx, total_vy, total_vz);
+    ESP_LOGE("DCATS", "Total Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", total_vx, total_vy, total_vz);
 }
 
 
@@ -373,14 +386,14 @@ void removeStaleDevices(uint32_t current_time) {
 
 
 void printDeviceTable() {
-    ESP_LOGI(TAG, "Device Table:");
+    ESP_LOGE(TAG, "Device Table:");
     for (int i = 0; i < device_count; i++) {
-        ESP_LOGE(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X | Lat: %ld, Lon: %ld, Alt: %ld, VelX: %d, VelY: %d, VelZ: %d, Time Boot: %ld, Last Update: %ld",
+        ESP_LOGE(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X | Lat: %ld, Lon: %ld, Alt: %ld, VelX: %d, VelY: %d, VelZ: %d, heading: %ld, Last Update: %ld",
                  devices[i].mac[0], devices[i].mac[1], devices[i].mac[2],
                  devices[i].mac[3], devices[i].mac[4], devices[i].mac[5],
                  devices[i].gps_data.lat, devices[i].gps_data.lon, devices[i].gps_data.alt,
                  devices[i].gps_data.vx, devices[i].gps_data.vy, devices[i].gps_data.vz,
-                 devices[i].gps_data.hdg);
+                 devices[i].gps_data.hdg, devices[i].last_update_time );
     }
 }
 
@@ -515,10 +528,13 @@ void ReadGPSandTarget(int32_t *lat, int32_t *lon, int32_t *alt, int16_t *velx, i
                     else if (msg.msgid == MAVLINK_MSG_ID_POSITION_TARGET_GLOBAL_INT) {
                         mavlink_position_target_global_int_t target_data;
                         mavlink_msg_position_target_global_int_decode(&msg, &target_data);
-                        t_lat = target_data.lat_int;
-                        t_lon = target_data.lon_int;
-                        t_alt = (int32_t)(target_data.alt * 1000);
-                        ESP_LOGE(TAG, "Target Latitude: %d, Longitude: %d", t_lat, t_lon);
+       
+                             t_lat = target_data.lat_int;
+                             t_lon = target_data.lon_int;
+                             t_alt = (int32_t)(target_data.alt * 1000);
+                             ESP_LOGE(TAG, "Target Latitude: %d, Longitude: %d", t_lat, t_lon);
+                       
+
                     }
                 }
             }
@@ -552,7 +568,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
         addOrUpdateDevice(mac, &receivedData, current_time);
 
         // Print the updated device table
-        printDeviceTable();
+        //printDeviceTable();
     } else {
         ESP_LOGE(TAG, "Invalid data length received");
     }
@@ -560,7 +576,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 
 
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    ESP_LOGI(TAG, "Message Send Status: %s", status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+   // ESP_LOGE(TAG, "Message Send Status: %s", status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
 }
 
 
@@ -616,17 +632,21 @@ Agent convertToAgent(const device_data& device) {
         device.gps_data.vy,
         device.gps_data.vz,
         device.gps_data.hdg
+
     };
 }
 
 void loop() {
+    int32_t latitude, longitude, altitude;
+    int16_t vel_x, vel_y, vel_z;
+    uint16_t hdg;
+    int32_t target_lat, target_lon, target_alt;
+
     // Read GPS data
-    //ReadGPS(&latitude, &longitude, &altitude, &vel_x, &vel_y, &vel_z, &hdg);
     ReadGPSandTarget(&latitude, &longitude, &altitude, &vel_x, &vel_y, &vel_z, &hdg, &target_lat, &target_lon, &target_alt);
 
     // Check if GPS data is valid
-    double total_vx, total_vy, total_vz;
-    if (latitude != 0 && longitude != 0 && target_lat != 0 && target_lon != 0  && target_alt != 0) {
+    if (latitude != 0 && longitude != 0) {
         myData.lat = latitude;
         myData.lon = longitude;
         myData.alt = altitude;
@@ -638,37 +658,61 @@ void loop() {
         myData.target_lon = target_lon;
         myData.target_alt = target_alt;
 
-        //ESP_LOGE(TAG, "Target Latitude: %d, Longitude: %d, Altitude: %d", target_lat, target_lon, target_alt);
-    
-
         // Send the data over ESP-NOW
         esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
         if (result == ESP_OK) {
-            ESP_LOGI(TAG, "GPS message sent successfully via ESP-NOW");
+            //ESP_LOGE(TAG, "GPS message sent successfully via ESP-NOW");
         } else {
             ESP_LOGE(TAG, "Error sending GPS message");
         }
-
-        std::vector<Agent> neighbors;
-
-        for (int i = 0; i < device_count; ++i) {  // Add 2 devices for example, extend as needed
-            neighbors.push_back(convertToAgent(devices[i]));
-        }
-
-        
-        computeTotalVelocity(myData, neighbors, total_vx, total_vy, total_vz);
-        } else {
-            total_vx, total_vy, total_vz = 0;
-            ESP_LOGI(TAG, "Waiting for valid GPS data...");
-
-        }
-    ESP_LOGE("DCATS", "Total Velocity (X, Y, Z): %.2f m/s, %.2f m/s, %.2f m/s", total_vx, total_vy, total_vz);
+    } else {
+        //ESP_LOGE(TAG, "Invalid GPS data, skipping this iteration");
+    }
 
     // Periodically check and remove stale devices
     uint32_t current_time = millis();
     removeStaleDevices(current_time);
 
+    // Initialize a vector for neighboring agents
+    std::vector<Agent> neighbors;
 
+    // Log device count to ensure it’s non-zero
+    //ESP_LOGE("NEIGHBOR", "Device count: %d", device_count);
 
+    // Check if devices array contains valid data
+    for (int i = 0; i < device_count; ++i) {
+        // Log the MAC address and check if data is valid before adding to neighbors
+        // ESP_LOGE("NEIGHBOR", "Checking device %d, MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+        //          i,
+        //          devices[i].mac[0], devices[i].mac[1], devices[i].mac[2],
+        //          devices[i].mac[3], devices[i].mac[4], devices[i].mac[5]);
 
+        // Add only valid devices to the neighbors vector
+        neighbors.push_back(convertToAgent(devices[i]));
+    }
+
+    // Log neighbor count to ensure neighbors are added correctly
+    //ESP_LOGE("NEIGHBOR", "Total neighbors: %d", neighbors.size());
+
+    // If neighbors are present, print their values
+    // if (!neighbors.empty()) {
+    //     for (size_t i = 0; i < neighbors.size(); ++i) {
+    //         ESP_LOGE("NEIGHBOR", "Neighbor %d Values:", i + 1);
+    //         ESP_LOGE("NEIGHBOR", "Latitude: %d", neighbors[i].lat);
+    //         ESP_LOGE("NEIGHBOR", "Longitude: %d", neighbors[i].lon);
+    //         ESP_LOGE("NEIGHBOR", "Altitude: %d", neighbors[i].alt);
+    //         ESP_LOGE("NEIGHBOR", "Velocity X: %d", neighbors[i].vx);
+    //         ESP_LOGE("NEIGHBOR", "Velocity Y: %d", neighbors[i].vy);
+    //         ESP_LOGE("NEIGHBOR", "Velocity Z: %d", neighbors[i].vz);
+    //         ESP_LOGE("NEIGHBOR", "Heading: %d", neighbors[i].hdg);
+    //         ESP_LOGE("NEIGHBOR", "---------");
+    //     }
+    // } else {
+    //     ESP_LOGE("NEIGHBOR", "No neighbors found.");
+    // }
+
+    double total_vx, total_vy, total_vz;
+    computeTotalVelocity(myData, neighbors, total_vx, total_vy, total_vz);
+
+    delay(100);  // Delay to control loop rate (10 Hz)
 }

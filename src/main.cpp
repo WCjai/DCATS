@@ -1284,9 +1284,9 @@ void velocityControlTask(void *pvParameters) {
         Agent agent2 = {-353634043, 1491651470, 82357, 4000 , 0, 0, 0};
         std::vector<Agent> neighbors = {agent2};
 
-        // for (int i = 0; i < device_count; ++i) {
-        //     neighbors.push_back(convertToAgent(devices[i]));
-        // }
+        for (int i = 0; i < device_count; ++i) {
+             neighbors.push_back(convertToAgent(devices[i]));
+         }
         double total_vx, total_vy, total_vz;
         computeTotalVelocity(myData, neighbors, total_vx, total_vy, total_vz);
 
